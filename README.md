@@ -769,7 +769,7 @@ if (of_has_feature(OF_HW_ANALOGIZER)) { /* Pocket with Analogizer */ }
 
 ### The deploy split
 
-The [openfpgaOS](https://github.com/openfpgaOS/openfpgaOS) repo only **builds** the cores; this SDK owns **all** device deployment — Pocket deploys by SD-card copy, MiSTer by network push. Platform-specific packaging and deploy logic lives in `src/sdk/platforms/<target>/`:
+The [openfpgaOS](https://github.com/openfpgaOS/openfpgaOS) repo **builds** the cores — and, for MiSTer, **releases** the game-agnostic core (`make package/release TARGET=mister`); this SDK owns **app/game** deployment — Pocket by SD-card copy, MiSTer by a network push of the per-game engine ELF. Platform-specific packaging and deploy logic lives in `src/sdk/platforms/<target>/`:
 
 ```
 src/sdk/platforms/
@@ -777,11 +777,13 @@ src/sdk/platforms/
 │   ├── templates/*.json      ← APF JSON config templates
 │   └── copy.sh               ← deploy: copy to the SD card
 └── mister/                   ← MiSTer (DE10-Nano / SuperStation One)
-    ├── mkimage.c, mkimage.sh ← FAT32 disk-image builder (vendored FatFs;
+    ├── mkimage.c             ← host FAT32 image builder (vendored FatFs;
     │                            no mtools or root needed)
+    ├── mkgame.sh, mkmgl.sh   ← per-game bundle (boot.vhd + saves) + .mgl launchers
+    ├── package.sh, mkdb.py   ← release zip + MiSTer Downloader database
     ├── copy.sh               ← deploy: network push (scp)
     ├── fatfs/                ← vendored ChaN FatFs (never edit)
-    └── README.md             ← artifacts + the slot→path contract
+    └── README.md, PACKAGING.md ← artifacts + the full packaging flow
 ```
 
 The per-platform core artifacts live under `runtime/` and are synced from an openfpgaOS checkout with `make sdk DEST=path/to/this/sdk` — they are build artifacts, not files to edit:
@@ -789,7 +791,7 @@ The per-platform core artifacts live under `runtime/` and are synced from an ope
 - `runtime/pocket/` — Pocket: `os25.rbf_r` **and** `os30.rbf_r` (two bitstream
   variants — see [Bitstream Variants](#bitstream-variants-pocket)), `os.bin`,
   `loader.bin`, `bank.ofsf`
-- `runtime/mister/` — MiSTer: `openfpgaOS.rbf`, `os.bin`
+- `runtime/mister/` — MiSTer: `os.bin` (`make sdk` no longer vendors the core bitstream into game repos — the game-agnostic core installs once from the openfpgaOS MiSTer core release, `make package/release TARGET=mister` in openfpgaOS)
 
 ### MiSTer quickstart
 
@@ -802,18 +804,15 @@ make copy TARGET=mister                          # push to mister.local
 MISTER_IP=192.168.1.42 make copy TARGET=mister   # or a specific device
 ```
 
-`copy.sh` assembles the FAT32 disk image (`openfpgaOS.vhd`) from your ELF plus the asset files sitting next to it, then pushes everything over the network:
+`make copy TARGET=mister` runs `copy.sh game`: it `scp`s the freshly built engine ELF to the loose file `games/OpenfpgaOS/<Game>/<GameElf>` (e.g. `doom.elf`) atomically, and touches nothing else. Your wads (the read-only `boot.vhd`) and the writable saves volume (`<Game>.vhd`, under `/media/fat/saves/OpenfpgaOS/`) are left in place — no Main-stop, no loop-mount. `make copy-app` is an alias of `make copy`.
 
-- `openfpgaOS.rbf` → `/media/fat/_Console/`
-- `boot.rom` + `openfpgaOS.vhd` → `/media/fat/games/openfpgaOS/`
-
-Load the core from the MiSTer menu and mount `openfpgaOS.vhd` once from the OSD — MiSTer remembers the mount. For core-only bring-up before an app exists:
+This is the per-game / update-safe model: the game-agnostic core lives at `/media/fat/_Computer/OpenfpgaOS.rbf`, installed **once** from the openfpgaOS core release (not vendored per game — see [The deploy split](#the-deploy-split)); each instance is a single 4-line `.mgl` that mounts its `boot.vhd` + `<Game>.vhd` and F-loads the engine ELF. The full build → publish → install flow is in [src/sdk/platforms/mister/PACKAGING.md](src/sdk/platforms/mister/PACKAGING.md). For core-only bring-up before an app exists:
 
 ```bash
-src/sdk/platforms/mister/copy.sh core 192.168.1.42   # pushes runtime/mister/ only
+src/sdk/platforms/mister/copy.sh core 192.168.1.42   # pushes boot.rom only (the rbf ships in the core release)
 ```
 
-Inside the image your app opens data files by filename, exactly as on Pocket (`/assets/*`, saves in `/saves/`). Two rules carry over: filenames are limited to 23 characters (the same registry limit as Pocket), and **never recreate the image's save/config files with ordinary tools** — they are preallocated contiguously so the firmware can persist saves without ever touching FAT metadata at runtime; that is the power-cut safety guarantee. `MISTER_IMAGE_MB` overrides the default 64 MB image size; `mkimage.sh` compiles its image tool with the host `cc` on first use. Full details — the artifact table and the slot→path contract — in [src/sdk/platforms/mister/README.md](src/sdk/platforms/mister/README.md).
+Your app opens data files by filename, exactly as on Pocket — wads on the read-only `boot.vhd`, saves in `/saves/` on the writable `<Game>.vhd`. Two rules carry over: filenames are limited to 23 characters (the same registry limit as Pocket), and **never recreate the writable save/config files with ordinary tools** — they are preallocated contiguously so the firmware can persist saves without ever touching FAT metadata at runtime; that is the power-cut safety guarantee. The older single-image model — one `openfpgaOS.vhd` holding app + assets + saves, mounted from the OSD (`MISTER_IMAGE_MB` sizes it) — still builds but is no longer the default. Full details — the per-game flow, the artifact table, and the slot→path contract — in [src/sdk/platforms/mister/PACKAGING.md](src/sdk/platforms/mister/PACKAGING.md) and [src/sdk/platforms/mister/README.md](src/sdk/platforms/mister/README.md).
 
 ### What stays Pocket-only
 

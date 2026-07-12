@@ -23,7 +23,7 @@ are **forks of this SDK**: same root layout, the game lives in
 make build CORE=<name>     # build a custom core (or cd src/<name> && make)
 make test  CORE=<name>     # desktop SDL2 build (./app_pc) — fastest iteration
 make copy  CORE=<name>     # deploy to Pocket SD card
-make copy  CORE=<name> TARGET=mister   # network-push to a MiSTer (MISTER_IP env, default mister.local)
+make copy  CORE=<name> TARGET=mister   # push the game's engine .elf to a MiSTer (per-game, update-safe: wads + saves untouched; MISTER_IP env, default mister.local)
 make debug CORE=<name>     # UART push + console stream (Pocket + DevKey only)
 ```
 
