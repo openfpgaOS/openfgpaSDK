@@ -12,5 +12,5 @@ releases/
 src/tools/phdp/phdp
 src/tools/phdp/phdpd
 
-# mister platform: compiled host tool (mkimage.sh rebuilds it on demand)
+# mister platform: compiled host tool (rebuilt on demand from mkimage.c)
 src/sdk/platforms/mister/.mkimage
