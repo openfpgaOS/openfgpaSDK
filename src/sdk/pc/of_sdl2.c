@@ -100,6 +100,10 @@ static const struct of_capabilities g_caps = {
     .mixer_rate  = OF_AUDIO_RATE,
     .platform_id = OF_PLATFORM_SIM,
     .cpu_freq_hz = 100000000u,
+    /* SDL_GetRelativeMouseState delivers real decoded counts, same as
+     * the v4 device OS -- without this flag a v4-aware app would run
+     * its raw-pair fallback decode on them and mangle every delta. */
+    .os_features = OF_OS_FEAT_MOUSE_COUNTS,
 };
 
 static uint64_t get_us(void) {

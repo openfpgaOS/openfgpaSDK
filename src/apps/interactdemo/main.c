@@ -388,6 +388,55 @@ static void update_interact(void)
            (unsigned long)of_interact_get(3));
 }
 
+/* Raw input-hub slot words, read straight off the periph page (the same
+ * hardcoded-MMIO approach the ScummVM backend uses for its speed knobs).
+ * Splits a dead mouse into layers: a 5xxxxxxx KEY on the S3 row means the
+ * dock+RTL transport is fine; "Present:no" above it then indicts the OS
+ * decode; both healthy indicts the app.  KEY[31:28]: 4=keyboard 5=mouse. */
+#define RAW32(a) (*(volatile uint32_t *)(a))
+
+static void update_raw(void)
+{
+    clear_row(27);
+    printf("S2 %08lx %08lx %08lx",
+           (unsigned long)RAW32(0x40000134u),   /* INPUT_SLOT_KEY(2)  */
+           (unsigned long)RAW32(0x40000138u),   /* INPUT_SLOT_JOY(2)  */
+           (unsigned long)RAW32(0x4000013Cu));  /* INPUT_SLOT_TRIG(2) */
+    clear_row(28);
+    printf("S3 %08lx %08lx %08lx",
+           (unsigned long)RAW32(0x40000144u),   /* INPUT_SLOT_KEY(3)  */
+           (unsigned long)RAW32(0x40000148u),   /* INPUT_SLOT_JOY(3)  */
+           (unsigned long)RAW32(0x4000014Cu));  /* INPUT_SLOT_TRIG(3) */
+    clear_row(29);
+    const struct of_capabilities *caps = of_get_caps();
+    printf("caps v%lu feat:%08lx hw:%08lx spd:%lu",
+           (unsigned long)(caps ? caps->version : 0),
+           (unsigned long)((caps && caps->version >= 4) ? caps->os_features : 0),
+           (unsigned long)RAW32(0x40000098u),   /* HW_FEATURES     */
+           (unsigned long)RAW32(0x4000006Cu));  /* MOUSE_SPEED_PCT */
+
+    /* Scanout scaler geometry.  The pixel readout is a Bresenham stepper:
+     * when fb_width == out_width the source advances exactly 1 px per output
+     * px; a mismatch makes it skip (fb>out) or repeat (fb<out) one source
+     * pixel per line, and because the accumulator carries across lines the
+     * skip WALKS down the screen -- text shears differently on every row.
+     * out_width is not a register: it is the scaler slot's width, decoded
+     * here the same way core_top's scaler_slot_width() does. */
+    static const unsigned short slot_w[8] = {320,320,320,320,320,400,256,640};
+    static const unsigned short slot_h[8] = {240,200,224,256,288,300,240,480};
+    uint32_t sz   = RAW32(0x400000E4u);          /* FB_MODE_SIZE   */
+    uint32_t slot = RAW32(0x400000ECu) & 7u;     /* VIDEO_SCALER_MODE */
+    unsigned fbw = (unsigned)(sz & 0x3FFu);
+    unsigned fbh = (unsigned)((sz >> 16) & 0x3FFu);
+    unsigned ow = slot_w[slot], oh = slot_h[slot];
+    clear_row(30);
+    FG_YELLOW; printf("Scaler "); RESET;
+    printf("fb %ux%u out %ux%u slot%lu stride%lu %s",
+           fbw, fbh, ow, oh, (unsigned long)slot,
+           (unsigned long)(RAW32(0x400000E8u) & 0xFFFFu),
+           (fbw == ow) ? "1:1" : "SCALED-X");
+}
+
 int main(void)
 {
     view_state_t state;
@@ -404,6 +453,7 @@ int main(void)
         update_keyboard(&state);
         update_mouse(&state);
         update_interact();
+        update_raw();
         usleep(16000);
     }
 }

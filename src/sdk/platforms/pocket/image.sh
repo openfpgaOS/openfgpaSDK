@@ -44,10 +44,41 @@ mkdir -p "$ASSET_DIR"
 # reported, not silently swallowed alongside the others).  The bitstream
 # is variant-named (os25.rbf_r / os30.rbf_r); copy exactly
 # the one this core's core.json points at — the single source of truth set
-# at scaffold time (customize.sh --variant).
+# at scaffold time (customize.sh --variant).  VARIANT=os20 (env) overrides
+# per-assembly: the STAGED core.json is rewritten so the core boots that
+# bitstream, while dist/ keeps the scaffold default.
 RBF=$(grep -o '"filename"[[:space:]]*:[[:space:]]*"[^"]*"' "$CORE_DIR/core.json" 2>/dev/null \
       | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 [ -n "$RBF" ] || RBF="bitstream.rbf_r"
+if [ -n "$VARIANT" ] && [ "${VARIANT}.rbf_r" != "$RBF" ]; then
+    NEW_RBF="${VARIANT}.rbf_r"
+    [ -f "$RT/$NEW_RBF" ] || { echo "Error: runtime/$NEW_RBF missing (VARIANT=$VARIANT)"; exit 1; }
+    sed -i "s/\"$RBF\"/\"$NEW_RBF\"/" "$CORE_DIR/core.json"
+    RBF="$NEW_RBF"
+    echo "  variant override: core boots $RBF"
+fi
+
+# Publish-manifest guard: openfpgaOS `make sdk` records md5s of the runtime
+# set it publishes atomically (runtime/MANIFEST).  A staged artifact that no
+# longer matches means a hand-mixed runtime set (e.g. a lone os.bin copied
+# in) -- exactly the firmware/bitstream pairing that boots into a blank
+# screen, so refuse to assemble the image.  Absent MANIFEST = no check
+# (pre-manifest publishes, or deliberately deleted to override).
+MANIFEST="$ROOT/runtime/MANIFEST"
+if [ -f "$MANIFEST" ]; then
+    for f in "pocket/$RBF" "pocket/os.bin" "pocket/loader.bin"; do
+        [ -f "$ROOT/runtime/$f" ] || continue
+        want=$(awk -v p="./$f" '$2==p{print $1}' "$MANIFEST")
+        [ -n "$want" ] || continue
+        have=$(md5sum "$ROOT/runtime/$f" | awk '{print $1}')
+        if [ "$want" != "$have" ]; then
+            echo "Error: runtime/$f does not match runtime/MANIFEST — hand-mixed runtime set."
+            echo "       Re-publish atomically ('make sdk DEST=…' in openfpgaOS), or delete"
+            echo "       runtime/MANIFEST to override deliberately."
+            exit 1
+        fi
+    done
+fi
 for f in "$RBF" loader.bin; do
     [ -f "$RT/$f" ] && cp "$RT/$f" "$CORE_DIR" || echo "  warn: runtime/$f missing (run 'make sdk VARIANT=… DEST=…' in openfpgaOS)"
 done
