@@ -353,6 +353,9 @@ static uint32_t _gpu_base;
 #define GPU_CMD_LOAD_VERTS           0x53   /* transform one raw vert into a 5-bit GPU
                                              * vertex-cache slot. 7-word. */
 #define GPU_CMD_DRAW_INDEXED_TRI     0x54   /* triangle from 3 cached slots. 1-word. */
+#define GPU_CMD_LOAD_VERT_CLIP       0x56   /* park ONE pre-transformed clip-space
+                                             * vert {x,y,w} in the cache (no MAC);
+                                             * wire-identical to 0x53 otherwise. */
 #define GPU_CMD_SET_LIGHT_STATE      0x55   /* sticky single dir light + ambient for
                                              * 0x57 lit loads. 6-word. */
 #define GPU_CMD_LOAD_VERT_LIT        0x57   /* transform+light one raw vert (object-
@@ -685,6 +688,62 @@ static inline void _gpu_ring_ensure(uint32_t bytes) {
         _gpu_dbg_ring_waits++;
         _gpu_dbg_ring_spin_iters += ring_spins;
     }
+}
+
+/* ---- Non-fatal emission guards ------------------------------------
+ * The waits above are bounded but fatal: on timeout they trap, taking
+ * the whole machine down.  That is right for a genuinely wedged
+ * pipeline, but wrong when the GPU is merely paused -- the platform
+ * menu freezes scanout, so the ring stops draining while the app keeps
+ * drawing, and the core dies in a spin that would have resolved the
+ * moment the menu closed.
+ *
+ * These let a caller ask before it commits, then drop the frame
+ * instead of trapping.  Neither emits a command nor blocks
+ * unboundedly, so both stay safe to call with the GPU stopped. */
+
+/* Pure probe: true when a batch of `bytes` can be emitted right now
+ * without entering any of the trapping waits.  Plain register reads,
+ * no side effects.  Ring space only grows until we emit (the GPU is
+ * the only consumer), so a caller that probes for its whole batch up
+ * front cannot then be blocked partway through emitting it.
+ *
+ * Ring space is the ONLY gate tested, deliberately.  It is tempting to
+ * also reject on GPU_STATUS_DMA_BUSY / DMA_DESC_FULL since the
+ * emission path has waits on both, but those are ordinary steady-state
+ * conditions: the descriptor FIFO is 2 deep and the SDK stages through
+ * two batch buffers precisely so a DMA can be in flight while the CPU
+ * fills the other one.  Rejecting on them makes this probe report
+ * "stalled" during perfectly healthy rendering.  Both waits are also
+ * downstream of ring space -- the DMA drains into the ring, so it
+ * completes whenever the ring has room, and _gpu_ring_ensure()'s spin
+ * is the one that actually goes fatal.  Gate on the root cause. */
+static inline int of_gpu_can_emit(uint32_t bytes) {
+    if (_gpu_batch_buf == NULL)
+        return 0;
+    if (bytes > (OF_GPU_RING_SIZE - 4u))
+        return 0;
+    return _gpu_ring_free_now() >= bytes;
+}
+
+/* Bounded, non-fatal ring reserve: spins at most `spin_limit`
+ * iterations waiting for `bytes` of ring space, returning 0 on timeout
+ * rather than trapping.  Deliberately does NOT flush staged commands
+ * the way _gpu_ring_ensure() does -- this answers "has the GPU drained
+ * enough to take more", and the flush path runs the fatal DMA wait. */
+static inline int of_gpu_try_reserve_bytes(uint32_t bytes,
+                                           uint32_t spin_limit) {
+    if (bytes > (OF_GPU_RING_SIZE - 4u))
+        return 0;
+    uint32_t ring_free = _gpu_ring_free_now();
+    _gpu_note_ring_free(ring_free);
+    while (ring_free < bytes) {
+        if (spin_limit-- == 0u)
+            return 0;
+        ring_free = _gpu_ring_free_now();
+        _gpu_note_ring_free(ring_free);
+    }
+    return 1;
 }
 
 static inline void _gpu_stream_reserve_words(uint32_t words) {
@@ -1995,11 +2054,45 @@ static inline void of_gpu_load_vert(uint8_t slot, int32_t vx, int32_t vy, int32_
     _gpu_ring_commit(7u);
 }
 
-/* Draw a triangle from three previously-loaded vertex-cache slots (0x53/0x57).
+/* Park ONE pre-transformed clip-space vert in a GPU vertex-cache slot: the CPU
+ * sends M*v clip {x,y,w} (Q16.16; w is the perspective divisor AND the sole
+ * depth source) and the GPU does ONLY recip+project -- same contract as 0x4F,
+ * but into the cache for 0x54 draw-many.  For hosts that do their own
+ * model/view/projection (Quake2 CPU geometry).  Requires the 0x50 sticky
+ * viewport (xc/yc/scales/near_clip; matrix words are don't-care) and a 0x4A
+ * surface.  Gated on OF_HW_GPU_CLIP_LOAD -- independent of the matrix MAC and
+ * deliberately NOT part of the bit-26 cluster. */
+static inline void of_gpu_load_vert_clip(uint8_t slot, int32_t cx, int32_t cy, int32_t cw,
+                                         int32_t s, int32_t t, uint16_t rgb,
+                                         uint32_t depth) {
+#ifndef OF_PC
+    if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_CLIP_LOAD))
+        return;
+#endif
+    _gpu_cmd_header(GPU_CMD_LOAD_VERT_CLIP, 8);
+    uint32_t *w = _gpu_ring_claim();
+    *w++ = (uint32_t)(slot & 0x1Fu);
+    *w++ = (uint32_t)cx;
+    *w++ = (uint32_t)cy;
+    *w++ = (uint32_t)cw;
+    *w++ = (uint32_t)s;
+    *w++ = (uint32_t)t;
+    *w++ = (uint32_t)rgb;
+    *w++ = depth;   /* explicit z-buffer depth: the GPU-derived value (= zi)
+                     * quantizes far-field z; send (1/w)*2^30 computed in float
+                     * for full legacy-0x4E depth precision.  zi (perspective)
+                     * is still GPU-derived from cw. */
+    _gpu_ring_commit(8u);
+}
+
+/* Draw a triangle from three previously-loaded vertex-cache slots (0x53/0x56/0x57).
  * One word packs three 5-bit indices.  Cluster-gated (OF_HW_GPU_XFORM_RGB). */
 static inline void of_gpu_draw_indexed_tri(uint8_t i0, uint8_t i1, uint8_t i2) {
 #ifndef OF_PC
-    if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_XFORM_RGB))
+    /* Cache draws work whenever ANY load path exists: matrix form (bit 26)
+     * or clip form (bit 29) -- a MAC-less build sets only the latter. */
+    if (!of_has_feature(OF_HW_GPU_VERT_TRI) ||
+        (!of_has_feature(OF_HW_GPU_XFORM_RGB) && !of_has_feature(OF_HW_GPU_CLIP_LOAD)))
         return;
 #endif
     _gpu_cmd_header(GPU_CMD_DRAW_INDEXED_TRI, 1);
@@ -2019,7 +2112,10 @@ static inline void of_gpu_set_light_state(int32_t dx, int32_t dy, int32_t dz,
                                           uint16_t light_rgb, uint16_t ambient_rgb,
                                           uint8_t enable) {
 #ifndef OF_PC
-    if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_XFORM_RGB))
+    /* Lighting has its own bit (30): os30 ships the transform front-end with
+     * the lighting cone excluded, so bit 26 alone no longer implies 0x55/57. */
+    if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_XFORM_RGB) ||
+        !of_has_feature(OF_HW_GPU_LIGHT))
         return;
 #endif
     _gpu_cmd_header(GPU_CMD_SET_LIGHT_STATE, 6);
@@ -2043,7 +2139,8 @@ static inline void of_gpu_load_vert_lit(uint8_t slot, int32_t vx, int32_t vy, in
                                         int32_t nx, int32_t ny, int32_t nz,
                                         int32_t s, int32_t t) {
 #ifndef OF_PC
-    if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_XFORM_RGB))
+    if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_XFORM_RGB) ||
+        !of_has_feature(OF_HW_GPU_LIGHT))
         return;
 #endif
     _gpu_cmd_header(GPU_CMD_LOAD_VERT_LIT, 9);
@@ -2174,6 +2271,10 @@ static inline void     of_gpu_draw_clip_tri(const int32_t cx[3], const int32_t c
 static inline void     of_gpu_load_vert(uint8_t slot, int32_t vx, int32_t vy, int32_t vz,
                                         int32_t s, int32_t t, uint16_t rgb)
                                         { (void)slot;(void)vx;(void)vy;(void)vz;(void)s;(void)t;(void)rgb; }
+static inline void     of_gpu_load_vert_clip(uint8_t slot, int32_t cx, int32_t cy, int32_t cw,
+                                             int32_t s, int32_t t, uint16_t rgb,
+                                             uint32_t depth)
+                                             { (void)slot;(void)cx;(void)cy;(void)cw;(void)s;(void)t;(void)rgb;(void)depth; }
 static inline void     of_gpu_draw_indexed_tri(uint8_t i0, uint8_t i1, uint8_t i2)
                                                { (void)i0;(void)i1;(void)i2; }
 static inline void     of_gpu_set_light_state(int32_t dx, int32_t dy, int32_t dz,
@@ -2202,6 +2303,8 @@ static inline uint32_t of_gpu_fence(void)                                 { retu
 static inline uint32_t of_gpu_submit(void)                                { return 0; }
 static inline int      of_gpu_fence_reached(uint32_t t)                   { (void)t; return 1; }
 static inline void     of_gpu_wait(uint32_t t)                            { (void)t; }
+static inline int      of_gpu_can_emit(uint32_t b)                        { (void)b; return 1; }
+static inline int      of_gpu_try_reserve_bytes(uint32_t b, uint32_t s)   { (void)b; (void)s; return 1; }
 static inline void     of_gpu_finish(void)                                {}
 static inline void     of_gpu_prepare_framebuffer_for_cpu(void)           {}
 static inline uint32_t of_gpu_flip_to(int idx)                            { (void)idx; return 0; }
