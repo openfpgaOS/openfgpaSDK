@@ -97,6 +97,13 @@ Hosting is `https://github.com/openfpgaOS/<Repo>/releases/latest/download/`:
   `raw.githubusercontent.com/<org>/<repo>/main/releases/mister/` — a stable
   per-core `db_url` that never goes stale and no other stream can hijack.
   Only single-release-stream repos may safely use `latest` for the db_url.
+- **DB and release assets are one atomic set.**  The DB pins md5s of the
+  exact staging it was computed from, and freshly built FAT images are never
+  byte-identical to a previous build — so NEVER publish a regenerated
+  json.zip without clobber-uploading that same staging's bundle files to the
+  release (field failure 2026-08-13: regenerated DBs pinned a changed
+  setup.sh while the releases served the old one; every sync failed hash
+  validation at the user's end).
 - Release assets have a 2 GB/file limit. `raw.githubusercontent` refuses
   anything over 100 MB, and these bundles ship multi-hundred-MB `.vhd` images —
   which is why the DB is generated `--url-mode flat` (every entry gets an
