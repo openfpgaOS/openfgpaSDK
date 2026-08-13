@@ -88,8 +88,15 @@ DB references as a **flat asset**.
 
 Hosting is `https://github.com/openfpgaOS/<Repo>/releases/latest/download/`:
 
-- `releases/latest/download/` always resolves to the newest release, so a
-  user's `downloader.ini` never goes stale and there is no dist branch to push.
+- **`releases/latest/download/` is ONE pointer per repository** — with several
+  release streams in one repo (doom/heretic/hexen) it resolves to whichever
+  core released last and serves the wrong stream's assets (user-reported,
+  2026-08-13).  The scheme is therefore: asset URLs inside the DB pin to the
+  release's own immutable tag (`releases/download/<core>-mister-v<ver>/`),
+  and the tiny `<core>.json.zip` is **committed to the repo** and served via
+  `raw.githubusercontent.com/<org>/<repo>/main/releases/mister/` — a stable
+  per-core `db_url` that never goes stale and no other stream can hijack.
+  Only single-release-stream repos may safely use `latest` for the db_url.
 - Release assets have a 2 GB/file limit. `raw.githubusercontent` refuses
   anything over 100 MB, and these bundles ship multi-hundred-MB `.vhd` images —
   which is why the DB is generated `--url-mode flat` (every entry gets an
