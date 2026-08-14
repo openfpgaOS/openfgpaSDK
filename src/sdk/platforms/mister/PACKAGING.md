@@ -18,13 +18,30 @@ and the firmware slot contract.
 
 | Volume | `.mgl` mount | Path on card | Holds | Lifecycle |
 |---|---|---|---|---|
-| **S0 `boot.vhd`** | `type=s index=0` (games-relative) | `games/OpenfpgaOS/<Game>/boot.vhd` | read-only shell: `/<Game>/common` = `bank.ofsf` + injected IWADs. **No engine ELF** (`--no-elf`). | update-replaceable |
+| **S0 `boot.vhd`** | `type=s index=0` (games-relative) | `games/OpenfpgaOS/<Game>/boot.vhd` | read-only shell: `/<Game>/common` = `bank.ofsf` + injected IWADs. **No engine ELF** (`--no-elf`). | **materialized by setup.sh** from the shipped template — never shipped raw |
 | **S1 `<Game>.vhd`** | `type=s index=1` (**absolute**) | `saves/OpenfpgaOS/<Game>.vhd` | writable: per-instance `cfg`s + `slot_0..9.sav`, each a 256 KB contiguous preallocated slot | **seeded once, never overwritten** |
 | **loose `<elf>`** | `type=f index=2` (F-load) | `games/OpenfpgaOS/<Game>/<elf>` (e.g. `doom.elf`) | the engine; DMA'd to ELF staging → firmware serves it as slot 3 | **swap this one file to update the engine** |
 
 S1 lives under the Downloader-**reserved** `saves/` tree (not `games/`), and the
 `.mgl` mounts it by **absolute** path, precisely so a Downloader re-sync or a
 manual reinstall never touches it.
+
+### The boot-shell template model
+
+The bundle/DB never ships the working `boot.vhd` — it ships **`boot.vhd.gz`**,
+a gzipped pristine shell (a mostly-zero FAT image compresses to a few MB, so
+shell sizes can be generous — see each game's `GAME_BOOT_MB`).  `setup.sh`
+gunzips it into the working `boot.vhd` whenever that image is missing **or the
+template changed** (`.boot.vhd.src` records the template md5 the image was
+built from), then re-injects the user's wads from `wads/`.
+
+Why: a Downloader-managed working image can only fail.  `overwrite:true`
+clobbers the user's injected wads on every update; `overwrite:false` (the old
+scheme) protects them but means a shell fix **never reaches existing
+installs**.  Splitting template (Downloader-owned, updates freely) from
+working image (user-owned, rebuilt locally, lossless because wads live in
+`wads/` and saves in S1) fixes both.  mkdb marks any straggler `boot*.vhd` /
+`*.saves.vhd` install-once as a safety net.
 
 ## 1. Host packaging — `make package TARGET=mister`
 
